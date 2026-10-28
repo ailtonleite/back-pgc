@@ -1,0 +1,25 @@
+# Núcleo (core/)
+shapely==2.1.2
+
+# API HTTP (api/)
+fastapi==0.156.4
+uvicorn==0.54.0
+PyJWT==2.15.1
+pydantic-settings==2.16.1
+
+# Visão computacional (adapters/yolo.py, adapters/camera.py)
+# O ultralytics instala o torch. Para usar GPU, instale antes o torch com CUDA:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+ultralytics==8.4.115
+opencv-python==5.0.0.93
+numpy==2.5.1
+
+# Persistência (adapters/database.py)
+sqlalchemy==2.1.5
+psycopg[binary]==3.3.6  # driver do PostgreSQL (DSN: postgresql+psycopg://...)
+
+# Segurança (adapters/security.py)
+bcrypt==5.0.0
+
+# AWS: DynamoDB e Kinesis Video Streams (modo "aws")
+boto3==1.43.114
