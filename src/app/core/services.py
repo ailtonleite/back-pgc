@@ -20,6 +20,7 @@ from app.core.models import (
     AcessoNegado,
     Camera,
     DadosInvalidos,
+    Demarcacao,
     FonteIndisponivel,
     NaoEncontrado,
     OccupancySnapshot,
@@ -31,6 +32,7 @@ from app.core.models import (
     SpotChange,
     SpotStatus,
     User,
+    diagnosticar_poligono,
 )
 from app.core.ports import (
     CameraRepository,
@@ -100,6 +102,22 @@ def _validar_texto(valor: str, descricao: str) -> str:
     return valor
 
 
+def _estacionamento_visivel(
+    estacionamentos: ParkingLotRepository, usuario: User | None, estacionamento_id: str
+) -> ParkingLot:
+    """Estacionamento ativo, ou inativo se ``usuario`` for responsável por ele.
+
+    Para os demais, um estacionamento inativo responde como inexistente.
+    """
+    estacionamento = estacionamentos.buscar(estacionamento_id)
+    visivel = estacionamento is not None and (
+        estacionamento.ativo or (usuario is not None and usuario.pode_gerenciar(estacionamento_id))
+    )
+    if not visivel:
+        raise NaoEncontrado("Estacionamento não encontrado.")
+    return estacionamento
+
+
 # --- Serviços ---
 
 
@@ -156,16 +174,40 @@ class ParkingLotService:
             return self.estacionamentos.listar_por_ids(usuario.estacionamentos)
         return self.estacionamentos.listar(apenas_ativos=True)
 
-    def atribuir_admin(self, usuario: User, estacionamento_id: str, admin_id: str) -> None:
-        """Torna outro administrador responsável pelo estacionamento."""
+    def obter(self, usuario: User, estacionamento_id: str) -> ParkingLot:
+        """Um estacionamento: ativo para todos; inativo só para os responsáveis."""
+        return _estacionamento_visivel(self.estacionamentos, usuario, estacionamento_id)
+
+    def listar_admins(self, usuario: User, estacionamento_id: str) -> list[User]:
+        """Administradores responsáveis pelo estacionamento."""
         _exigir_gestao(usuario, estacionamento_id)
         _obter(self.estacionamentos.buscar(estacionamento_id), "Estacionamento")
-        admin = _obter(self.usuarios.buscar(admin_id), "Usuário")
+        admins = self.usuarios.listar_por_estacionamento(estacionamento_id)
+        return sorted(admins, key=lambda u: u.nome.lower())
+
+    def atribuir_admin(
+        self,
+        usuario: User,
+        estacionamento_id: str,
+        admin_id: str | None = None,
+        email: str | None = None,
+    ) -> User:
+        """Torna outro administrador responsável, identificado pelo id ou pelo e-mail."""
+        _exigir_gestao(usuario, estacionamento_id)
+        _obter(self.estacionamentos.buscar(estacionamento_id), "Estacionamento")
+        if admin_id:
+            admin = self.usuarios.buscar(admin_id)
+        elif email:
+            admin = self.usuarios.buscar_por_email(email.strip().lower())
+        else:
+            raise DadosInvalidos("Informe o id ou o e-mail do administrador.")
+        admin = _obter(admin, "Usuário")
         if not admin.e_admin():
             raise DadosInvalidos("Somente administradores podem ser responsáveis.")
         if estacionamento_id not in admin.estacionamentos:
             admin.estacionamentos.append(estacionamento_id)
             self.usuarios.salvar(admin)
+        return admin
 
     def remover_admin(self, usuario: User, estacionamento_id: str, admin_id: str) -> None:
         """Retira a responsabilidade, impedindo remover o último responsável."""
@@ -194,14 +236,19 @@ class CameraManager:
         processador: FrameProcessor,
         fabrica_fonte: Callable[[Camera], FrameSource],
         intervalo_s: float = 1.0,
+        sessoes: ParkingSessionService | None = None,
     ) -> None:
         self.cameras = cameras
         self.vagas = vagas
         self.processador = processador
         self.fabrica_fonte = fabrica_fonte
         self.intervalo_s = intervalo_s
+        self.sessoes = sessoes  # encerra as sessões das vagas removidas com a câmera
         self._tarefas: dict[str, asyncio.Task] = {}
         self._sinais_parada: dict[str, asyncio.Event] = {}
+        # Último frame processado por câmera em monitoramento: é a imagem que gerou
+        # o status atual das vagas, devolvida por capturar_frame sem abrir outra fonte.
+        self._ultimos_frames: dict[str, ndarray] = {}
 
     def _camera_gerenciavel(self, usuario: User, camera_id: str) -> Camera:
         camera = _obter(self.cameras.buscar(camera_id), "Câmera")
@@ -217,6 +264,10 @@ class CameraManager:
         """Câmeras de um estacionamento."""
         _exigir_gestao(usuario, estacionamento_id)
         return self.cameras.listar_por_estacionamento(estacionamento_id)
+
+    def obter(self, usuario: User, camera_id: str) -> Camera:
+        """Uma câmera do estacionamento sob responsabilidade do usuário."""
+        return self._camera_gerenciavel(usuario, camera_id)
 
     def cadastrar(
         self, usuario: User, estacionamento_id: str, nome: str, stream_url: str, tipo_fonte: str
@@ -254,15 +305,25 @@ class CameraManager:
         """Para o monitoramento e remove a câmera e suas vagas (UC08, fluxo A2)."""
         self._camera_gerenciavel(usuario, camera_id)
         await self._parar_laco(camera_id)
+        vagas = self.vagas.listar_por_camera(camera_id)
         self.vagas.remover_por_camera(camera_id)
+        if self.sessoes is not None:
+            for vaga in vagas:
+                self.sessoes.vaga_removida(vaga.id)
         self.cameras.remover(camera_id)
 
     def capturar_frame(self, usuario: User, camera_id: str) -> ndarray:
-        """Captura um frame de referência para a demarcação das vagas (UC08, fluxo E1).
+        """Frame da câmera: para a demarcação das vagas (UC08, fluxo E1) e para o mapa.
 
-        Bloqueante: deve ser chamado fora do loop assíncrono (ex.: rota síncrona).
+        Com a câmera em monitoramento, devolve o último frame processado pelo laço,
+        exatamente a imagem que gerou o status atual das vagas. Com a câmera parada,
+        abre a fonte e lê um frame; nesse caso é bloqueante e deve ser chamado fora
+        do loop assíncrono (ex.: rota síncrona).
         """
         camera = self._camera_gerenciavel(usuario, camera_id)
+        ultimo = self._ultimos_frames.get(camera_id)
+        if ultimo is not None:
+            return ultimo.copy()
         fonte = self.fabrica_fonte(camera)
         try:
             fonte.abrir()
@@ -333,6 +394,9 @@ class CameraManager:
                     logger.warning("Fonte da câmera %s indisponível; encerrando captura.", camera.id)
                     break
                 await asyncio.to_thread(self.processador.processar, camera, frame)
+                # Guardado só depois do processamento, para a imagem e o status das
+                # vagas corresponderem ao mesmo instante.
+                self._ultimos_frames[camera.id] = frame
                 try:
                     await asyncio.wait_for(parar.wait(), timeout=self.intervalo_s)
                 except asyncio.TimeoutError:
@@ -345,14 +409,21 @@ class CameraManager:
             if self._tarefas.get(camera.id) is asyncio.current_task():
                 del self._tarefas[camera.id]
                 del self._sinais_parada[camera.id]
+                self._ultimos_frames.pop(camera.id, None)
 
 
 class SpotCalibrationService:
     """Demarcação manual das vagas sobre o frame de referência (UC08, passo 4)."""
 
-    def __init__(self, vagas: SpotRepository, cameras: CameraRepository) -> None:
+    def __init__(
+        self,
+        vagas: SpotRepository,
+        cameras: CameraRepository,
+        sessoes: ParkingSessionService | None = None,
+    ) -> None:
         self.vagas = vagas
         self.cameras = cameras
+        self.sessoes = sessoes  # encerra as sessões das vagas removidas
 
     def _camera_gerenciavel(self, usuario: User, camera_id: str) -> Camera:
         camera = _obter(self.cameras.buscar(camera_id), "Câmera")
@@ -365,40 +436,47 @@ class SpotCalibrationService:
         return self.vagas.listar_por_camera(camera_id)
 
     def definir_vagas(
-        self, usuario: User, camera_id: str, demarcacoes: list[tuple[str, list[Point]]]
+        self, usuario: User, camera_id: str, demarcacoes: list[Demarcacao]
     ) -> list[ParkingSpot]:
-        """Substitui as vagas da câmera pelas demarcações (rótulo + polígono).
+        """Substitui as vagas da câmera pelas demarcações.
 
-        Vagas com rótulo já existente na câmera mantêm o id e o status, para não
-        invalidar sessões abertas nelas.
+        Demarcações com ``id`` atualizam a vaga existente, mantendo o id, o status e
+        as sessões abertas nela; as sem ``id`` criam vagas novas; as vagas da câmera
+        ausentes da lista são removidas e suas sessões, encerradas.
         """
         camera = self._camera_gerenciavel(usuario, camera_id)
-        demarcacoes = [(_validar_texto(r, "Rótulo"), p) for r, p in demarcacoes]
-        for _, poligono in demarcacoes:
-            self._validar_poligono(poligono)
-        atuais = {v.rotulo: v for v in self.vagas.listar_por_camera(camera_id)}
-        self._validar_rotulos(
-            demarcacoes, camera.estacionamento_id, ignorar={v.id for v in atuais.values()}
-        )
+        rotulos = [_validar_texto(d.rotulo, "Rótulo") for d in demarcacoes]
+        for demarcacao in demarcacoes:
+            self._validar_poligono(demarcacao.poligono)
+        atuais = {v.id: v for v in self.vagas.listar_por_camera(camera_id)}
+        ids = [d.id for d in demarcacoes if d.id]
+        repetidos = {i for i in ids if ids.count(i) > 1}
+        if repetidos:
+            raise DadosInvalidos(f"Vaga enviada mais de uma vez: {', '.join(sorted(repetidos))}.")
+        alheios = set(ids) - atuais.keys()
+        if alheios:
+            raise DadosInvalidos(
+                f"Vagas que não pertencem a esta câmera: {', '.join(sorted(alheios))}."
+            )
+        self._validar_rotulos(rotulos, camera.estacionamento_id, ignorar=set(atuais))
 
         novas: list[ParkingSpot] = []
-        for rotulo, poligono in demarcacoes:
-            existente = atuais.pop(rotulo, None)
-            if existente is not None:
-                existente.poligono = list(poligono)
-                novas.append(existente)
+        for rotulo, demarcacao in zip(rotulos, demarcacoes):
+            if demarcacao.id:
+                vaga = atuais.pop(demarcacao.id)
+                vaga.rotulo = rotulo
+                vaga.poligono = list(demarcacao.poligono)
             else:
-                novas.append(
-                    ParkingSpot(
-                        id=_novo_id(),
-                        estacionamento_id=camera.estacionamento_id,
-                        camera_id=camera_id,
-                        rotulo=rotulo,
-                        poligono=list(poligono),
-                    )
+                vaga = ParkingSpot(
+                    id=_novo_id(),
+                    estacionamento_id=camera.estacionamento_id,
+                    camera_id=camera_id,
+                    rotulo=rotulo,
+                    poligono=list(demarcacao.poligono),
                 )
+            novas.append(vaga)
         for removida in atuais.values():
-            self.vagas.remover(removida.id)
+            self._remover(removida.id)
         self.vagas.salvar_varias(novas)
         return novas
 
@@ -417,34 +495,41 @@ class SpotCalibrationService:
             vaga.poligono = list(poligono)
         if rotulo is not None:
             rotulo = _validar_texto(rotulo, "Rótulo")
-            self._validar_rotulos([(rotulo, vaga.poligono)], vaga.estacionamento_id, {vaga.id})
+            self._validar_rotulos([rotulo], vaga.estacionamento_id, {vaga.id})
             vaga.rotulo = rotulo
         self.vagas.salvar(vaga)
         return vaga
 
     def remover_vaga(self, usuario: User, vaga_id: str) -> None:
-        """Remove uma vaga."""
+        """Remove uma vaga e encerra as sessões abertas nela."""
         vaga = _obter(self.vagas.buscar(vaga_id), "Vaga")
         _exigir_gestao(usuario, vaga.estacionamento_id)
+        self._remover(vaga_id)
+
+    def _remover(self, vaga_id: str) -> None:
         self.vagas.remover(vaga_id)
+        if self.sessoes is not None:
+            self.sessoes.vaga_removida(vaga_id)
 
     @staticmethod
     def _validar_poligono(poligono: list[Point]) -> None:
-        """Exige 4 pontos e área positiva."""
+        """Exige 4 pontos distintos, área positiva e lados que não se cruzam.
+
+        O polígono nunca é corrigido: o que é salvo é o que o administrador desenhou.
+        """
         if len(poligono) != 4:
             raise DadosInvalidos("A vaga deve ter exatamente 4 pontos.")
-        teste = ParkingSpot(id="", estacionamento_id="", camera_id="", rotulo="", poligono=poligono)
-        if teste.area() <= 0:
-            raise DadosInvalidos("O polígono da vaga deve ter área positiva.")
+        problema = diagnosticar_poligono(poligono)
+        if problema:
+            raise DadosInvalidos(problema)
 
     def _validar_rotulos(
         self,
-        demarcacoes: list[tuple[str, list[Point]]],
+        rotulos: list[str],
         estacionamento_id: str,
         ignorar: set[str] = frozenset(),
     ) -> None:
         """Impede rótulos repetidos no mesmo estacionamento (desconsidera as vagas em ``ignorar``)."""
-        rotulos = [rotulo for rotulo, _ in demarcacoes]
         repetidos = {r for r in rotulos if rotulos.count(r) > 1}
         existentes = {
             v.rotulo
@@ -510,25 +595,43 @@ class FrameProcessor:
 
 
 class OccupancyService:
-    """Consulta do estado atual (RF03, RF05, UC01, UC02, UC05)."""
+    """Consulta do estado atual (RF03, RF05, UC01, UC02, UC05).
 
-    def __init__(self, vagas: SpotRepository, estacionamentos: ParkingLotRepository) -> None:
+    Estacionamentos inativos só são visíveis aos admins responsáveis, que podem
+    conferir o mapa e a detecção antes de liberá-los aos motoristas.
+    """
+
+    def __init__(
+        self,
+        vagas: SpotRepository,
+        estacionamentos: ParkingLotRepository,
+        cameras: CameraRepository,
+    ) -> None:
         self.vagas = vagas
         self.estacionamentos = estacionamentos
+        self.cameras = cameras  # nomes das câmeras exibidos no mapa
 
-    def _validar_estacionamento(self, estacionamento_id: str) -> None:
-        estacionamento = self.estacionamentos.buscar(estacionamento_id)
-        if estacionamento is None or not estacionamento.ativo:
-            raise NaoEncontrado("Estacionamento não encontrado.")
+    def _validar_estacionamento(self, estacionamento_id: str, usuario: User | None) -> None:
+        _estacionamento_visivel(self.estacionamentos, usuario, estacionamento_id)
 
-    def estado_atual(self, estacionamento_id: str) -> list[ParkingSpot]:
+    def estado_atual(
+        self, estacionamento_id: str, usuario: User | None = None
+    ) -> list[ParkingSpot]:
         """Vagas com o status atual (para o mapa)."""
-        self._validar_estacionamento(estacionamento_id)
+        self._validar_estacionamento(estacionamento_id, usuario)
         return self.vagas.listar_por_estacionamento(estacionamento_id)
 
-    def totais(self, estacionamento_id: str) -> OccupancySnapshot:
+    def nomes_cameras(
+        self, estacionamento_id: str, usuario: User | None = None
+    ) -> dict[str, str]:
+        """Nome de cada câmera do estacionamento, por id (abas do mapa)."""
+        self._validar_estacionamento(estacionamento_id, usuario)
+        return {c.id: c.nome for c in self.cameras.listar_por_estacionamento(estacionamento_id)}
+
+    def totais(self, estacionamento_id: str, usuario: User | None = None) -> OccupancySnapshot:
         """Totais de vagas livres/ocupadas e taxa de ocupação."""
-        return OccupancySnapshot.de_vagas(estacionamento_id, self.estado_atual(estacionamento_id))
+        vagas = self.estado_atual(estacionamento_id, usuario)
+        return OccupancySnapshot.de_vagas(estacionamento_id, vagas)
 
 
 class HistoryService:
@@ -687,6 +790,10 @@ class ParkingSessionService:
         for sessao in self.sessoes.sessoes_ativas_na_vaga(vaga_id):
             sessao.encerrar(momento)
             self.sessoes.salvar(sessao)
+
+    def vaga_removida(self, vaga_id: str) -> None:
+        """Encerra as sessões ativas em uma vaga removida pelo admin."""
+        self.vaga_liberada(vaga_id, datetime.now(timezone.utc))
 
 
 class AuthService:

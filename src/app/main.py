@@ -86,7 +86,12 @@ class Settings(BaseSettings):
     jwt_segredo: str | None = None  # no modo local, gerado a cada execução se ausente
     jwt_expiracao_min: int = 480
     cookie_seguro: bool = False  # True em produção (HTTPS)
-    cors_origens: list[str] = []  # origens do front-end, ex.: ["http://localhost:5173"]
+    # "lax" basta com front e API no mesmo site (ex.: app.dominio.br e api.dominio.br);
+    # "none" (exige cookie_seguro) só se estiverem em domínios diferentes.
+    cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    # Origens do front-end quando ele não é servido pela mesma origem da API,
+    # ex.: ["https://app.dominio.br"]. Nunca "*": o navegador recusa com credenciais.
+    cors_origens: list[str] = []
 
     # Primeiro administrador (seed): criado na subida se ainda não existir
     admin_email: str | None = None
@@ -99,6 +104,13 @@ class Settings(BaseSettings):
             faltando = [n for n in ("database_url", "jwt_segredo") if not getattr(self, n)]
             if faltando:
                 raise ValueError(f"Modo aws exige: {', '.join('APP_' + n.upper() for n in faltando)}.")
+        if "*" in self.cors_origens:
+            raise ValueError(
+                "APP_CORS_ORIGENS não pode conter '*': o cookie de login exige origens explícitas."
+            )
+        self.cors_origens = [origem.rstrip("/") for origem in self.cors_origens]
+        if self.cookie_samesite == "none" and not self.cookie_seguro:
+            raise ValueError("APP_COOKIE_SAMESITE=none exige APP_COOKIE_SEGURO=true (HTTPS).")
         if not self.jwt_segredo:
             self.jwt_segredo = secrets.token_urlsafe(32)
         return self
@@ -127,10 +139,15 @@ class Container:
             self.detector, self.estrategia, self.vagas, self.eventos, self.sessao_service
         )
         self.camera_manager = CameraManager(
-            self.cameras, self.vagas, self.frame_processor, criar_fonte, config.intervalo_captura_s
+            self.cameras,
+            self.vagas,
+            self.frame_processor,
+            criar_fonte,
+            config.intervalo_captura_s,
+            self.sessao_service,
         )
-        self.calibracao = SpotCalibrationService(self.vagas, self.cameras)
-        self.ocupacao = OccupancyService(self.vagas, self.estacionamentos)
+        self.calibracao = SpotCalibrationService(self.vagas, self.cameras, self.sessao_service)
+        self.ocupacao = OccupancyService(self.vagas, self.estacionamentos, self.cameras)
         self.historico_service = HistoryService(self.vagas, self.estacionamentos, self.historico)
         self.auth = AuthService(self.usuarios, self.hasher)
 

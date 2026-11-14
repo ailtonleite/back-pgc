@@ -7,7 +7,7 @@ estacionamento o admin gerencia fica nos serviços; aqui só se exige o perfil.
 O ``Container`` precisa expor: ``auth``, ``estacionamento_service``,
 ``camera_manager``, ``calibracao``, ``ocupacao``, ``historico_service``,
 ``sessao_service``, ``eventos`` e ``config`` com ``jwt_segredo``,
-``jwt_expiracao_min`` e ``cookie_seguro``.
+``jwt_expiracao_min``, ``cookie_seguro`` e ``cookie_samesite``.
 """
 
 from __future__ import annotations
@@ -26,9 +26,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.schemas import (
     AdminIn,
+    AdminOut,
     CadastroIn,
     CameraIn,
     CameraOut,
+    EstacionamentoEdicaoIn,
     EstacionamentoIn,
     EstacionamentoOut,
     LoginIn,
@@ -149,7 +151,7 @@ def criar_token(usuario: User, resposta: Response, config: Any) -> None:
         max_age=int(expiracao.total_seconds()),
         httponly=True,
         secure=config.cookie_seguro,  # True em produção (HTTPS)
-        samesite="lax",
+        samesite=config.cookie_samesite,
     )
 
 
@@ -234,8 +236,12 @@ def login(
 
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(usuario: Autenticado, resposta: Response) -> None:
-    resposta.delete_cookie(COOKIE_TOKEN, httponly=True, samesite="lax")
+def logout(usuario: Autenticado, resposta: Response, request: Request) -> None:
+    config = _container(request).config
+    # Os atributos precisam coincidir com os do login, ou o navegador ignora a remoção.
+    resposta.delete_cookie(
+        COOKIE_TOKEN, httponly=True, secure=config.cookie_seguro, samesite=config.cookie_samesite
+    )
     logger.info("Logout: %r.", usuario.email)
 
 
@@ -263,9 +269,10 @@ def _sessao_out(
     if atual is None:
         return None
     sessao, vaga = atual
-    estacionamento = next(
-        (e for e in estacionamentos.listar_para(usuario) if e.id == sessao.estacionamento_id), None
-    )
+    try:
+        estacionamento = estacionamentos.obter(usuario, sessao.estacionamento_id)
+    except NaoEncontrado:  # estacionamento desativado depois do registro
+        estacionamento = None
     return SessaoOut.de_entidade(sessao, vaga, estacionamento)
 
 
@@ -323,15 +330,29 @@ def criar_estacionamento(
     return EstacionamentoOut.de_entidade(estacionamento)
 
 
+@router.get("/estacionamentos/{estacionamento_id}", response_model=EstacionamentoOut)
+def obter_estacionamento(
+    estacionamento_id: str,
+    usuario: Autenticado,
+    servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
+) -> EstacionamentoOut:
+    """Estacionamento ativo, ou inativo para os admins responsáveis (404 nos demais casos)."""
+    return EstacionamentoOut.de_entidade(servico.obter(usuario, estacionamento_id))
+
+
 @router.put("/estacionamentos/{estacionamento_id}", response_model=EstacionamentoOut)
 def editar_estacionamento(
     estacionamento_id: str,
-    dados: EstacionamentoIn,
+    dados: EstacionamentoEdicaoIn,
     usuario: Admin,
     servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
 ) -> EstacionamentoOut:
-    """Altera apenas os campos enviados."""
-    campos = dados.model_dump(exclude_unset=True)
+    """Altera apenas os campos enviados; ``endereco: null`` apaga o endereço."""
+    campos = {
+        campo: valor
+        for campo, valor in dados.model_dump(exclude_unset=True).items()
+        if valor is not None or campo == "endereco"
+    }
     return EstacionamentoOut.de_entidade(servico.editar(usuario, estacionamento_id, **campos))
 
 
@@ -344,6 +365,15 @@ def remover_estacionamento(
     servico.remover(usuario, estacionamento_id)
 
 
+@router.get("/estacionamentos/{estacionamento_id}/admins", response_model=list[AdminOut])
+def listar_admins(
+    estacionamento_id: str,
+    usuario: Admin,
+    servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
+) -> list[AdminOut]:
+    return [AdminOut.de_entidade(a) for a in servico.listar_admins(usuario, estacionamento_id)]
+
+
 @router.post(
     "/estacionamentos/{estacionamento_id}/admins", status_code=status.HTTP_204_NO_CONTENT
 )
@@ -353,7 +383,8 @@ def atribuir_admin(
     usuario: Admin,
     servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
 ) -> None:
-    servico.atribuir_admin(usuario, estacionamento_id, dados.usuario_id)
+    """Aceita ``usuario_id`` ou ``email`` do administrador."""
+    servico.atribuir_admin(usuario, estacionamento_id, dados.usuario_id, dados.email)
 
 
 @router.delete(
@@ -377,19 +408,21 @@ def remover_admin(
 @router.get("/estacionamentos/{estacionamento_id}/vagas", response_model=list[VagaOut])
 def estado_atual(
     estacionamento_id: str,
-    _: Autenticado,
+    usuario: Autenticado,
     ocupacao: Annotated[OccupancyService, Depends(_ocupacao)],
 ) -> list[VagaOut]:
-    return [VagaOut.de_entidade(v) for v in ocupacao.estado_atual(estacionamento_id)]
+    vagas = ocupacao.estado_atual(estacionamento_id, usuario)
+    nomes = ocupacao.nomes_cameras(estacionamento_id, usuario)
+    return [VagaOut.de_entidade(v, nomes.get(v.camera_id)) for v in vagas]
 
 
 @router.get("/estacionamentos/{estacionamento_id}/totais", response_model=TotaisOut)
 def totais(
     estacionamento_id: str,
-    _: Autenticado,
+    usuario: Autenticado,
     ocupacao: Annotated[OccupancyService, Depends(_ocupacao)],
 ) -> TotaisOut:
-    return TotaisOut.de_entidade(ocupacao.totais(estacionamento_id))
+    return TotaisOut.de_entidade(ocupacao.totais(estacionamento_id, usuario))
 
 
 def _evento_sse(mudanca: SpotChange) -> str:
@@ -428,12 +461,12 @@ async def _fluxo_sse(eventos: EventPublisher, estacionamento_id: str) -> AsyncIt
 @router.get("/estacionamentos/{estacionamento_id}/eventos")
 def eventos_sse(
     estacionamento_id: str,
-    _: Autenticado,
+    usuario: Autenticado,
     ocupacao: Annotated[OccupancyService, Depends(_ocupacao)],
     eventos: Annotated[EventPublisher, Depends(_eventos)],
 ) -> StreamingResponse:
     """Mudanças de status das vagas via Server-Sent Events (evento ``vaga``)."""
-    ocupacao.estado_atual(estacionamento_id)  # 404 se não existir ou estiver inativo
+    ocupacao.estado_atual(estacionamento_id, usuario)  # 404 se não existir ou não for visível
     return StreamingResponse(
         _fluxo_sse(eventos, estacionamento_id),
         media_type="text/event-stream",
@@ -511,6 +544,13 @@ def cadastrar_camera(
     return CameraOut.de_entidade(camera)
 
 
+@router.get("/cameras/{camera_id}", response_model=CameraOut)
+def obter_camera(
+    camera_id: str, usuario: Admin, cameras: Annotated[CameraManager, Depends(_cameras)]
+) -> CameraOut:
+    return CameraOut.de_entidade(cameras.obter(usuario, camera_id))
+
+
 @router.put("/cameras/{camera_id}", response_model=CameraOut)
 async def atualizar_camera(
     camera_id: str,
@@ -537,10 +577,12 @@ async def remover_camera(
 def capturar_frame(
     camera_id: str, usuario: Admin, cameras: Annotated[CameraManager, Depends(_cameras)]
 ) -> Response:
-    """Frame de referência (JPEG) para o admin demarcar as vagas.
+    """Imagem da câmera (JPEG), para a demarcação das vagas e o fundo do mapa.
 
-    Rota síncrona de propósito: a conexão com a câmera é bloqueante e roda no
-    threadpool do FastAPI.
+    Em monitoramento, é o último frame processado: a mesma imagem que gerou o
+    status atual das vagas. Parada, a câmera é aberta na hora para ler um frame;
+    por isso a rota é síncrona, e essa conexão bloqueante roda no threadpool do
+    FastAPI.
     """
     frame = cameras.capturar_frame(usuario, camera_id)
     ok, jpeg = cv2.imencode(".jpg", frame)
@@ -568,8 +610,10 @@ def listar_vagas(
     camera_id: str,
     usuario: Admin,
     calibracao: Annotated[SpotCalibrationService, Depends(_calibracao)],
+    cameras: Annotated[CameraManager, Depends(_cameras)],
 ) -> list[VagaOut]:
-    return [VagaOut.de_entidade(v) for v in calibracao.listar_vagas(usuario, camera_id)]
+    nome = cameras.obter(usuario, camera_id).nome
+    return [VagaOut.de_entidade(v, nome) for v in calibracao.listar_vagas(usuario, camera_id)]
 
 
 @router.put("/cameras/{camera_id}/vagas", response_model=list[VagaOut])
@@ -578,7 +622,13 @@ def definir_vagas(
     dados: list[VagaIn],
     usuario: Admin,
     calibracao: Annotated[SpotCalibrationService, Depends(_calibracao)],
+    cameras: Annotated[CameraManager, Depends(_cameras)],
 ) -> list[VagaOut]:
-    """Substitui todas as vagas da câmera pelas demarcações enviadas."""
-    demarcacoes = [(v.rotulo, [p.para_entidade() for p in v.poligono]) for v in dados]
-    return [VagaOut.de_entidade(v) for v in calibracao.definir_vagas(usuario, camera_id, demarcacoes)]
+    """Substitui as vagas da câmera pelas demarcações enviadas.
+
+    Vagas com ``id`` são atualizadas (mantendo as sessões abertas nelas), vagas sem
+    ``id`` são criadas e as vagas da câmera ausentes da lista são removidas.
+    """
+    nome = cameras.obter(usuario, camera_id).nome
+    vagas = calibracao.definir_vagas(usuario, camera_id, [v.para_entidade() for v in dados])
+    return [VagaOut.de_entidade(v, nome) for v in vagas]

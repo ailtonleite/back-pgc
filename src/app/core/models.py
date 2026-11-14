@@ -19,11 +19,34 @@ def _agora() -> datetime:
 
 
 def _para_poligono(pontos: list[Point]) -> _ShapelyPolygon:
-    """Converte uma lista de ``Point`` em polígono do shapely, corrigindo autointerseções."""
+    """Converte uma lista de ``Point`` em polígono do shapely, corrigindo autointerseções.
+
+    A correção serve às caixas de detecção; vagas com lados cruzados são recusadas
+    antes de serem salvas (ver ``diagnosticar_poligono``).
+    """
     poligono = _ShapelyPolygon([(p.x, p.y) for p in pontos])
     if not poligono.is_valid:
         poligono = poligono.buffer(0)
     return poligono
+
+
+def diagnosticar_poligono(pontos: list[Point]) -> str | None:
+    """Motivo pelo qual o polígono não pode ser uma vaga, ou ``None`` se estiver correto.
+
+    Ao contrário de ``_para_poligono``, não corrige nada: o polígono salvo tem de
+    ser exatamente o que o administrador desenhou.
+    """
+    if len(set(pontos)) != len(pontos):
+        return "O polígono da vaga não pode ter pontos repetidos."
+    poligono = _ShapelyPolygon([(p.x, p.y) for p in pontos])
+    if poligono.is_valid:
+        return None if poligono.area > 0 else "O polígono da vaga deve ter área positiva."
+    if poligono.buffer(0).area <= 0:  # pontos alinhados
+        return "O polígono da vaga deve ter área positiva."
+    return (
+        "Os lados do polígono da vaga não podem se cruzar: "
+        "marque os pontos em sequência, contornando a vaga."
+    )
 
 
 # --- Exceções de domínio (traduzidas em códigos HTTP pela camada api/) ---
@@ -145,6 +168,19 @@ class ParkingSpot:
         self.status = novo
         self.atualizado_em = _agora()
         return True
+
+
+@dataclass
+class Demarcacao:
+    """Vaga desenhada pelo administrador.
+
+    Com ``id``, atualiza a vaga existente (preservando as sessões abertas nela);
+    sem ``id``, cria uma vaga nova.
+    """
+
+    rotulo: str
+    poligono: list[Point]
+    id: str | None = None
 
 
 @dataclass

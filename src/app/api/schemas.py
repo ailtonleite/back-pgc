@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.models import (
     Camera,
+    Demarcacao,
     OccupancySnapshot,
     ParkingLot,
     ParkingSession,
@@ -63,9 +64,19 @@ class PlacaIn(BaseModel):
 
 
 class EstacionamentoIn(BaseModel):
+    """Cadastro de estacionamento."""
+
     nome: str
     endereco: str | None = None
-    ativo: bool | None = None  # na edição, torna o estacionamento visível/oculto
+    ativo: bool | None = None
+
+
+class EstacionamentoEdicaoIn(BaseModel):
+    """Edição parcial: só os campos enviados são alterados."""
+
+    nome: str | None = None
+    endereco: str | None = None
+    ativo: bool | None = None  # torna o estacionamento visível/oculto aos motoristas
 
 
 class EstacionamentoOut(BaseModel):
@@ -85,7 +96,26 @@ class EstacionamentoOut(BaseModel):
 
 
 class AdminIn(BaseModel):
-    usuario_id: str
+    """Administrador a tornar responsável, pelo id ou pelo e-mail (exatamente um)."""
+
+    usuario_id: str | None = None
+    email: str | None = None
+
+    @model_validator(mode="after")
+    def _um_identificador(self) -> AdminIn:
+        if bool(self.usuario_id) == bool(self.email):
+            raise ValueError("Informe usuario_id ou email (apenas um).")
+        return self
+
+
+class AdminOut(BaseModel):
+    id: str
+    nome: str
+    email: str
+
+    @classmethod
+    def de_entidade(cls, usuario: User) -> AdminOut:
+        return cls(id=usuario.id, nome=usuario.nome, email=usuario.email)
 
 
 # --- Câmeras e vagas ---
@@ -128,23 +158,35 @@ class PontoIn(BaseModel):
 
 
 class VagaIn(BaseModel):
+    """Vaga demarcada. Com ``id``, atualiza a vaga existente; sem ``id``, cria uma nova."""
+
+    id: str | None = None
     rotulo: str
     poligono: list[PontoIn] = Field(min_length=4, max_length=4)
+
+    def para_entidade(self) -> Demarcacao:
+        return Demarcacao(
+            rotulo=self.rotulo,
+            poligono=[p.para_entidade() for p in self.poligono],
+            id=self.id,
+        )
 
 
 class VagaOut(BaseModel):
     id: str
     camera_id: str
+    camera_nome: str | None
     rotulo: str
     poligono: list[PontoIn]
     status: SpotStatus
     atualizado_em: datetime
 
     @classmethod
-    def de_entidade(cls, vaga: ParkingSpot) -> VagaOut:
+    def de_entidade(cls, vaga: ParkingSpot, camera_nome: str | None = None) -> VagaOut:
         return cls(
             id=vaga.id,
             camera_id=vaga.camera_id,
+            camera_nome=camera_nome,
             rotulo=vaga.rotulo,
             poligono=[PontoIn(x=p.x, y=p.y) for p in vaga.poligono],
             status=vaga.status,
