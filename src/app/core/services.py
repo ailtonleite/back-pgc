@@ -21,6 +21,7 @@ from app.core.models import (
     Camera,
     DadosInvalidos,
     Demarcacao,
+    Endereco,
     FonteIndisponivel,
     NaoEncontrado,
     OccupancySnapshot,
@@ -59,6 +60,10 @@ TIPOS_FONTE = {"arquivo", "rtsp", "kinesis"}
 GRANULARIDADES = {"hora", "dia", "semana"}
 FUSO_PADRAO = timezone(timedelta(hours=-3), "BRT")  # horário de Brasília (sem horário de verão)
 TAMANHO_MIN_SENHA = 8
+UFS = {
+    "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA",
+    "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+}
 _FORMATO_PLACA = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")  # antigo AAA1234 e Mercosul AAA1A23
 
 
@@ -102,6 +107,27 @@ def _validar_texto(valor: str, descricao: str) -> str:
     return valor
 
 
+def _validar_endereco(endereco: Endereco | None) -> Endereco | None:
+    """Normaliza o endereço: textos sem espaços nas pontas, UF em maiúsculas e CEP só com dígitos."""
+    if endereco is None:
+        return None
+    estado = (endereco.estado or "").strip().upper()
+    if estado not in UFS:
+        raise DadosInvalidos("Estado inválido: use a sigla da UF (ex.: SP).")
+    cep = re.sub(r"[\s.-]", "", endereco.cep or "")
+    if not re.fullmatch(r"\d{8}", cep):
+        raise DadosInvalidos("CEP inválido: use 8 dígitos (ex.: 09210-580).")
+    return Endereco(
+        rua=_validar_texto(endereco.rua, "Rua"),
+        numero=_validar_texto(endereco.numero, "Número"),
+        bairro=_validar_texto(endereco.bairro, "Bairro"),
+        cidade=_validar_texto(endereco.cidade, "Cidade"),
+        estado=estado,
+        cep=cep,
+        complemento=(endereco.complemento or "").strip() or None,
+    )
+
+
 def _estacionamento_visivel(
     estacionamentos: ParkingLotRepository, usuario: User | None, estacionamento_id: str
 ) -> ParkingLot:
@@ -134,11 +160,13 @@ class ParkingLotService:
         self.usuarios = usuarios
         self.cameras = cameras  # para impedir a remoção de estacionamento com câmeras
 
-    def criar(self, usuario: User, nome: str, endereco: str | None = None) -> ParkingLot:
+    def criar(
+        self, usuario: User, nome: str, endereco: Endereco | None = None
+    ) -> ParkingLot:
         """Cria o estacionamento e torna o criador responsável por ele."""
         _exigir_admin(usuario)
         estacionamento = ParkingLot(
-            id=_novo_id(), nome=_validar_texto(nome, "Nome"), endereco=endereco
+            id=_novo_id(), nome=_validar_texto(nome, "Nome"), endereco=_validar_endereco(endereco)
         )
         self.estacionamentos.salvar(estacionamento)
         usuario.estacionamentos.append(estacionamento.id)
@@ -146,11 +174,13 @@ class ParkingLotService:
         return estacionamento
 
     def editar(self, usuario: User, estacionamento_id: str, **campos: Any) -> ParkingLot:
-        """Altera nome, endereço ou status ativo."""
+        """Altera nome, endereço (substituído por inteiro; ``None`` remove) ou status ativo."""
         _exigir_gestao(usuario, estacionamento_id)
         estacionamento = _obter(self.estacionamentos.buscar(estacionamento_id), "Estacionamento")
         if "nome" in campos:
             campos["nome"] = _validar_texto(campos["nome"], "Nome")
+        if "endereco" in campos:
+            campos["endereco"] = _validar_endereco(campos["endereco"])
         _aplicar_campos(estacionamento, campos, {"nome", "endereco", "ativo"})
         self.estacionamentos.salvar(estacionamento)
         return estacionamento

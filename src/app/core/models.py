@@ -100,12 +100,25 @@ class Point:
 
 
 @dataclass
+class Endereco:
+    """Endereço de um estacionamento. ``estado`` é a sigla da UF; ``cep``, só os 8 dígitos."""
+
+    rua: str
+    numero: str  # texto: aceita "s/n", "123A"
+    bairro: str
+    cidade: str
+    estado: str
+    cep: str
+    complemento: str | None = None
+
+
+@dataclass
 class ParkingLot:
     """Estacionamento: agrupa câmeras e vagas."""
 
     id: str
     nome: str
-    endereco: str | None = None
+    endereco: Endereco | None = None
     ativo: bool = False
     criado_em: datetime = field(default_factory=_agora)
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.core.models import (
     Camera,
     Demarcacao,
+    Endereco,
     OccupancySnapshot,
     ParkingLot,
     ParkingSession,
@@ -63,34 +64,78 @@ class PlacaIn(BaseModel):
 # --- Estacionamentos ---
 
 
+class EnderecoIn(BaseModel):
+    """Endereço. ``estado``: sigla da UF; ``cep``: 8 dígitos, com ou sem hífen."""
+
+    rua: str
+    numero: str
+    complemento: str | None = None
+    bairro: str
+    cidade: str
+    estado: str
+    cep: str
+
+    def para_entidade(self) -> Endereco:
+        return Endereco(**self.model_dump())
+
+
+class EnderecoOut(BaseModel):
+    """``cep`` sai só com os 8 dígitos."""
+
+    rua: str
+    numero: str
+    complemento: str | None
+    bairro: str
+    cidade: str
+    estado: str
+    cep: str
+
+    @classmethod
+    def de_entidade(cls, endereco: Endereco) -> EnderecoOut:
+        return cls(
+            rua=endereco.rua,
+            numero=endereco.numero,
+            complemento=endereco.complemento,
+            bairro=endereco.bairro,
+            cidade=endereco.cidade,
+            estado=endereco.estado,
+            cep=endereco.cep,
+        )
+
+
 class EstacionamentoIn(BaseModel):
     """Cadastro de estacionamento."""
 
     nome: str
-    endereco: str | None = None
+    endereco: EnderecoIn | None = None
     ativo: bool | None = None
 
 
 class EstacionamentoEdicaoIn(BaseModel):
-    """Edição parcial: só os campos enviados são alterados."""
+    """Edição parcial: só os campos enviados são alterados.
+
+    O ``endereco`` é substituído por inteiro (envie todos os campos dele);
+    ``endereco: null`` remove o endereço.
+    """
 
     nome: str | None = None
-    endereco: str | None = None
+    endereco: EnderecoIn | None = None
     ativo: bool | None = None  # torna o estacionamento visível/oculto aos motoristas
 
 
 class EstacionamentoOut(BaseModel):
     id: str
     nome: str
-    endereco: str | None
+    endereco: EnderecoOut | None
     ativo: bool
 
     @classmethod
     def de_entidade(cls, estacionamento: ParkingLot) -> EstacionamentoOut:
+        endereco = estacionamento.endereco
         return cls(
             id=estacionamento.id,
             nome=estacionamento.nome,
-            endereco=estacionamento.endereco,
+            endereco=EnderecoOut.de_entidade(endereco) if endereco else None,
             ativo=estacionamento.ativo,
         )
 

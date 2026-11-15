@@ -324,7 +324,8 @@ def criar_estacionamento(
     usuario: Admin,
     servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
 ) -> EstacionamentoOut:
-    estacionamento = servico.criar(usuario, dados.nome, dados.endereco)
+    endereco = dados.endereco.para_entidade() if dados.endereco else None
+    estacionamento = servico.criar(usuario, dados.nome, endereco)
     if dados.ativo:
         estacionamento = servico.editar(usuario, estacionamento.id, ativo=True)
     return EstacionamentoOut.de_entidade(estacionamento)
@@ -347,12 +348,17 @@ def editar_estacionamento(
     usuario: Admin,
     servico: Annotated[ParkingLotService, Depends(_estacionamentos)],
 ) -> EstacionamentoOut:
-    """Altera apenas os campos enviados; ``endereco: null`` apaga o endereço."""
+    """Altera apenas os campos enviados.
+
+    O ``endereco`` é substituído por inteiro; ``endereco: null`` remove o endereço.
+    """
     campos = {
-        campo: valor
-        for campo, valor in dados.model_dump(exclude_unset=True).items()
-        if valor is not None or campo == "endereco"
+        campo: getattr(dados, campo)
+        for campo in dados.model_fields_set
+        if getattr(dados, campo) is not None or campo == "endereco"
     }
+    if campos.get("endereco") is not None:
+        campos["endereco"] = campos["endereco"].para_entidade()
     return EstacionamentoOut.de_entidade(servico.editar(usuario, estacionamento_id, **campos))
 
 

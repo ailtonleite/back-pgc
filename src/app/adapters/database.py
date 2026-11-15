@@ -13,6 +13,7 @@ import sqlalchemy as sa
 
 from app.core.models import (
     Camera,
+    Endereco,
     OccupancySnapshot,
     ParkingLot,
     ParkingSession,
@@ -319,10 +320,19 @@ _estacionamentos = sa.Table(
     _metadata,
     sa.Column("id", _ID, primary_key=True),
     sa.Column("nome", sa.String(200), nullable=False),
-    sa.Column("endereco", sa.String(300)),
+    # Endereço opcional: ou todas as colunas obrigatórias dele estão preenchidas, ou nenhuma.
+    sa.Column("endereco_rua", sa.String(200)),
+    sa.Column("endereco_numero", sa.String(20)),
+    sa.Column("endereco_complemento", sa.String(100)),
+    sa.Column("endereco_bairro", sa.String(100)),
+    sa.Column("endereco_cidade", sa.String(100)),
+    sa.Column("endereco_estado", sa.String(2)),
+    sa.Column("endereco_cep", sa.String(8)),
     sa.Column("ativo", sa.Boolean, nullable=False),
     sa.Column("criado_em", sa.DateTime(timezone=True), nullable=False),
 )
+
+_CAMPOS_ENDERECO = ("rua", "numero", "complemento", "bairro", "cidade", "estado", "cep")
 
 _cameras = sa.Table(
     "cameras",
@@ -441,7 +451,10 @@ class PostgresParkingLotRepository(_PostgresRepository, ParkingLotRepository):
                 {
                     "id": estacionamento.id,
                     "nome": estacionamento.nome,
-                    "endereco": estacionamento.endereco,
+                    **{
+                        f"endereco_{campo}": getattr(estacionamento.endereco, campo, None)
+                        for campo in _CAMPOS_ENDERECO
+                    },
                     "ativo": estacionamento.ativo,
                     "criado_em": estacionamento.criado_em,
                 },
@@ -458,10 +471,15 @@ class PostgresParkingLotRepository(_PostgresRepository, ParkingLotRepository):
 
     @staticmethod
     def _de_linha(linha: sa.Row) -> ParkingLot:
+        endereco = None
+        if linha.endereco_rua is not None:
+            endereco = Endereco(
+                **{campo: getattr(linha, f"endereco_{campo}") for campo in _CAMPOS_ENDERECO}
+            )
         return ParkingLot(
             id=linha.id,
             nome=linha.nome,
-            endereco=linha.endereco,
+            endereco=endereco,
             ativo=linha.ativo,
             criado_em=_utc(linha.criado_em),
         )
