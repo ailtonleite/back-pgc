@@ -428,7 +428,7 @@ def totais(
     usuario: Autenticado,
     ocupacao: Annotated[OccupancyService, Depends(_ocupacao)],
 ) -> TotaisOut:
-    return TotaisOut.de_entidade(ocupacao.totais(estacionamento_id, usuario))
+    return TotaisOut.de_entidade(*ocupacao.totais_com_preferenciais(estacionamento_id, usuario))
 
 
 def _evento_sse(mudanca: SpotChange) -> str:
@@ -492,7 +492,7 @@ def historico(
     fim: datetime,
     usuario: Admin,
     servico: Annotated[HistoryService, Depends(_historico)],
-    granularidade: Literal["hora", "dia", "semana"] = Query("hora"),
+    granularidade: Literal["minuto", "hora", "dia", "semana"] = Query("hora"),
 ) -> list[SnapshotOut]:
     snapshots = servico.consultar(
         usuario,

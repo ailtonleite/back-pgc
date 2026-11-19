@@ -292,6 +292,7 @@ class DynamoSpotRepository(SpotRepository):
             "poligono": [{"x": Decimal(str(p.x)), "y": Decimal(str(p.y))} for p in vaga.poligono],
             "status": vaga.status.value,
             "atualizado_em": vaga.atualizado_em.isoformat(),
+            "preferencial": vaga.preferencial,
         }
 
     @staticmethod
@@ -305,6 +306,7 @@ class DynamoSpotRepository(SpotRepository):
             poligono=[Point(float(p["x"]), float(p["y"])) for p in item["poligono"]],
             status=SpotStatus(item["status"]),
             atualizado_em=datetime.fromisoformat(item["atualizado_em"]),
+            preferencial=bool(item.get("preferencial", False)),  # itens antigos não têm o campo
         )
 
 

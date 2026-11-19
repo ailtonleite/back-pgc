@@ -208,12 +208,14 @@ class VagaIn(BaseModel):
     id: str | None = None
     rotulo: str
     poligono: list[PontoIn] = Field(min_length=4, max_length=4)
+    preferencial: bool = False
 
     def para_entidade(self) -> Demarcacao:
         return Demarcacao(
             rotulo=self.rotulo,
             poligono=[p.para_entidade() for p in self.poligono],
             id=self.id,
+            preferencial=self.preferencial,
         )
 
 
@@ -225,6 +227,7 @@ class VagaOut(BaseModel):
     poligono: list[PontoIn]
     status: SpotStatus
     atualizado_em: datetime
+    preferencial: bool
 
     @classmethod
     def de_entidade(cls, vaga: ParkingSpot, camera_nome: str | None = None) -> VagaOut:
@@ -236,6 +239,7 @@ class VagaOut(BaseModel):
             poligono=[PontoIn(x=p.x, y=p.y) for p in vaga.poligono],
             status=vaga.status,
             atualizado_em=vaga.atualizado_em,
+            preferencial=vaga.preferencial,
         )
 
 
@@ -243,19 +247,31 @@ class VagaOut(BaseModel):
 
 
 class TotaisOut(BaseModel):
+    """Totais de todas as vagas; os ``preferenciais_*`` contam só as preferenciais."""
+
     total: int
     livres: int
     ocupadas: int
     taxa_ocupacao: float
+    preferenciais_total: int = 0
+    preferenciais_livres: int = 0
+    preferenciais_ocupadas: int = 0
 
     @classmethod
-    def de_entidade(cls, snapshot: OccupancySnapshot) -> TotaisOut:
-        return cls(
+    def de_entidade(
+        cls, snapshot: OccupancySnapshot, preferenciais: OccupancySnapshot | None = None
+    ) -> TotaisOut:
+        totais = cls(
             total=snapshot.total,
             livres=snapshot.livres,
             ocupadas=snapshot.ocupadas,
             taxa_ocupacao=snapshot.taxa_ocupacao,
         )
+        if preferenciais is not None:
+            totais.preferenciais_total = preferenciais.total
+            totais.preferenciais_livres = preferenciais.livres
+            totais.preferenciais_ocupadas = preferenciais.ocupadas
+        return totais
 
 
 class SnapshotOut(BaseModel):

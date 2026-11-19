@@ -161,6 +161,7 @@ class ParkingSpot:
     poligono: list[Point]
     status: SpotStatus = SpotStatus.DESCONHECIDA
     atualizado_em: datetime = field(default_factory=_agora)
+    preferencial: bool = False  # idosos, PcD etc.
 
     def area(self) -> float:
         """Área do polígono em pixels²."""
@@ -194,6 +195,7 @@ class Demarcacao:
     rotulo: str
     poligono: list[Point]
     id: str | None = None
+    preferencial: bool = False
 
 
 @dataclass

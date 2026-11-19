@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 TIPOS_FONTE = {"arquivo", "rtsp", "kinesis"}
-GRANULARIDADES = {"hora", "dia", "semana"}
+GRANULARIDADES = {"minuto", "hora", "dia", "semana"}
 FUSO_PADRAO = timezone(timedelta(hours=-3), "BRT")  # horário de Brasília (sem horário de verão)
 TAMANHO_MIN_SENHA = 8
 UFS = {
@@ -496,6 +496,7 @@ class SpotCalibrationService:
                 vaga = atuais.pop(demarcacao.id)
                 vaga.rotulo = rotulo
                 vaga.poligono = list(demarcacao.poligono)
+                vaga.preferencial = demarcacao.preferencial
             else:
                 vaga = ParkingSpot(
                     id=_novo_id(),
@@ -503,6 +504,7 @@ class SpotCalibrationService:
                     camera_id=camera_id,
                     rotulo=rotulo,
                     poligono=list(demarcacao.poligono),
+                    preferencial=demarcacao.preferencial,
                 )
             novas.append(vaga)
         for removida in atuais.values():
@@ -516,10 +518,13 @@ class SpotCalibrationService:
         vaga_id: str,
         rotulo: str | None = None,
         poligono: list[Point] | None = None,
+        preferencial: bool | None = None,
     ) -> ParkingSpot:
         """Altera uma vaga existente."""
         vaga = _obter(self.vagas.buscar(vaga_id), "Vaga")
         _exigir_gestao(usuario, vaga.estacionamento_id)
+        if preferencial is not None:
+            vaga.preferencial = preferencial
         if poligono is not None:
             self._validar_poligono(poligono)
             vaga.poligono = list(poligono)
@@ -663,11 +668,21 @@ class OccupancyService:
         vagas = self.estado_atual(estacionamento_id, usuario)
         return OccupancySnapshot.de_vagas(estacionamento_id, vagas)
 
+    def totais_com_preferenciais(
+        self, estacionamento_id: str, usuario: User | None = None
+    ) -> tuple[OccupancySnapshot, OccupancySnapshot]:
+        """Totais de todas as vagas e, separadamente, só das preferenciais."""
+        vagas = self.estado_atual(estacionamento_id, usuario)
+        return (
+            OccupancySnapshot.de_vagas(estacionamento_id, vagas),
+            OccupancySnapshot.de_vagas(estacionamento_id, [v for v in vagas if v.preferencial]),
+        )
+
 
 class HistoryService:
     """Histórico e relatórios (RF04, UC06, UC07).
 
-    O agrupamento por hora/dia/semana usa o fuso ``fuso`` (padrão: horário de Brasília).
+    O agrupamento por minuto/hora/dia/semana usa o fuso ``fuso`` (padrão: horário de Brasília).
     """
 
     def __init__(
@@ -700,7 +715,7 @@ class HistoryService:
         fim: datetime,
         granularidade: str,
     ) -> list[OccupancySnapshot]:
-        """Histórico agregado por ``"hora"``, ``"dia"`` ou ``"semana"``."""
+        """Histórico agregado por ``"minuto"``, ``"hora"``, ``"dia"`` ou ``"semana"``."""
         _exigir_gestao(usuario, estacionamento_id)
         if granularidade not in GRANULARIDADES:
             raise DadosInvalidos(f"Granularidade deve ser uma de: {', '.join(sorted(GRANULARIDADES))}.")
@@ -758,7 +773,10 @@ class HistoryService:
         return agregados
 
     def _inicio_periodo(self, momento: datetime, granularidade: str) -> datetime:
-        local = momento.astimezone(self.fuso).replace(minute=0, second=0, microsecond=0)
+        local = momento.astimezone(self.fuso).replace(second=0, microsecond=0)
+        if granularidade == "minuto":
+            return local
+        local = local.replace(minute=0)
         if granularidade == "hora":
             return local
         local = local.replace(hour=0)

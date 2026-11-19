@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -74,7 +75,7 @@ class Settings(BaseSettings):
     device: str | None = None  # "0" (GPU), "cpu" ou None (automático)
     limiar_ocupacao: float = 0.4
     intervalo_captura_s: float = 1.0
-    intervalo_snapshot_min: float = 5.0
+    intervalo_snapshot_min: float = 1.0  # 1 ponto por minuto no histórico "Por minuto"
 
     # Persistência (modo "aws")
     database_url: str | None = None
@@ -218,9 +219,16 @@ class Container:
 
 
 async def _agendar_snapshots(historico: HistoryService, intervalo_min: float) -> None:
-    """Grava periodicamente a ocupação de cada estacionamento ativo."""
+    """Grava periodicamente a ocupação de cada estacionamento ativo.
+
+    As gravações são alinhadas ao relógio (com 1 min: hh:mm:00, hh:mm+1:00...),
+    de modo que o tempo gasto em cada uma não se acumula e nenhum minuto
+    fica sem snapshot no histórico por minuto.
+    """
+    intervalo_s = intervalo_min * 60
     while True:
-        await asyncio.sleep(intervalo_min * 60)
+        # +0,5 s de folga para cair com segurança dentro do novo período.
+        await asyncio.sleep(intervalo_s - time.time() % intervalo_s + 0.5)
         try:
             await asyncio.to_thread(historico.registrar_snapshots)
         except Exception:
